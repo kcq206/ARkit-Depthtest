@@ -146,8 +146,8 @@ struct ARSCNViewContainer: UIViewRepresentable {
         private func runVision(frame: ARFrame) {
             defer { DispatchQueue.main.async { self.visionBusy = false } }
 
-            let poseReq = VNDetectHumanBodyPoseRequest()
-            let rectReq = VNDetectHumanRectanglesRequest()
+            let poseReq = VNDetectHumanBodyPoseRequest() //For detecting head
+            let rectReq = VNDetectHumanRectanglesRequest() //For bounding box
             rectReq.upperBodyOnly = false
 
             let handler = VNImageRequestHandler(cvPixelBuffer: frame.capturedImage,
@@ -188,7 +188,7 @@ struct ARSCNViewContainer: UIViewRepresentable {
             }
         }
 
-        // MARK: - Draw overlays
+        // MARK: - Draw overlays for debugging (bounding box and red dot for head)
         private func drawOverlays(headPoints: [CGPoint], boundingBoxes: [CGRect], in view: ARSCNView) {
             let vs = view.bounds.size
 
