@@ -1,387 +1,310 @@
 import SwiftUI
 import ARKit
 import SceneKit
-import Vision
-import CoreVideo
-import UIKit
 import Combine
 
-// MARK: - Shared State
-class ARState: ObservableObject {
-    @Published var personDetected: Bool = false
-    @Published var detectedCount: Int = 0
-    @Published var isPlaced: Bool = false
+// MARK: - Data Model
+
+struct PersonDepthInfo: Identifiable {
+    let id: Int
+    let averageDepth: Float
+    let minDepth: Float
+    let maxDepth: Float
+    let pixelCount: Int
+    let normRect: CGRect
 }
 
-// MARK: - Root View
-struct ContentView: View {
-    @StateObject private var state = ARState()
+// MARK: - ViewModel
 
-    var body: some View {
-        ZStack {
-            ARSCNViewContainer(state: state)
-                .edgesIgnoringSafeArea(.all)
+final class ARViewModel: ObservableObject {
+    @Published var people: [PersonDepthInfo] = []
+    @Published var statusMessage = "Initialising…"
+    @Published var isRunning = false
+}
 
-            VStack {
-                HStack {
-                    Circle()
-                        .fill(state.personDetected ? Color.green : Color.gray)
-                        .frame(width: 10, height: 10)
-                    Text(state.isPlaced
-                         ? "Placed"
-                         : (state.personDetected
-                            ? "Tap to place (\(state.detectedCount) detected)"
-                            : "No person detected"))
-                        .font(.system(.caption, design: .monospaced))
-                        .foregroundColor(.white)
-                }
-                .padding(8)
-                .background(Color.black.opacity(0.5))
-                .cornerRadius(8)
-                .padding(.top, 60)
-                Spacer()
-            }
-        }
+// MARK: - UIViewRepresentable  (owns the ARSCNView + ARSession + delegate)
+
+struct ARCameraView: UIViewRepresentable {
+
+    @ObservedObject var vm: ARViewModel
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(vm: vm)
     }
-}
-
-// MARK: - AR View Container
-struct ARSCNViewContainer: UIViewRepresentable {
-    let state: ARState
-
-    func makeCoordinator() -> Coordinator { Coordinator(state: state) }
 
     func makeUIView(context: Context) -> ARSCNView {
-        let arView = ARSCNView(frame: .zero)
-        context.coordinator.arView = arView
+        let scnView = ARSCNView()
+        scnView.scene = SCNScene()
+        scnView.automaticallyUpdatesLighting = true
 
-        arView.delegate = context.coordinator
-        arView.session.delegate = context.coordinator
-        arView.scene = SCNScene()
-        arView.automaticallyUpdatesLighting = true
+        scnView.session.delegate = context.coordinator
+        context.coordinator.scnView = scnView
+
+        guard ARWorldTrackingConfiguration.supportsFrameSemantics(.personSegmentationWithDepth) else {
+            DispatchQueue.main.async {
+                self.vm.statusMessage = "⚠️ Device does not support person segmentation with depth"
+            }
+            return scnView
+        }
 
         let config = ARWorldTrackingConfiguration()
-        config.isAutoFocusEnabled = true
-        if ARWorldTrackingConfiguration.supportsFrameSemantics(.smoothedSceneDepth) {
-            config.frameSemantics.insert(.smoothedSceneDepth)
-        } else if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
-            config.frameSemantics.insert(.sceneDepth)
+        config.frameSemantics = [.personSegmentationWithDepth]
+        scnView.session.run(config, options: [.resetTracking, .removeExistingAnchors])
+
+        DispatchQueue.main.async {
+            self.vm.isRunning    = true
+            self.vm.statusMessage = "Running * point at people"
         }
-        arView.session.run(config, options: [.resetTracking, .removeExistingAnchors])
 
-        let tap = UITapGestureRecognizer(target: context.coordinator,
-                                         action: #selector(Coordinator.handleTap(_:)))
-        arView.addGestureRecognizer(tap)
-
-        arView.layer.addSublayer(context.coordinator.boxOverlayLayer)
-        arView.layer.addSublayer(context.coordinator.headOverlayLayer)
-        context.coordinator.configureOverlayLayers()
-
-        return arView
+        return scnView
     }
 
-    func updateUIView(_ uiView: ARSCNView, context: Context) {
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        context.coordinator.boxOverlayLayer.frame  = uiView.bounds
-        context.coordinator.headOverlayLayer.frame = uiView.bounds
-        CATransaction.commit()
-    }
+    func updateUIView(_ uiView: ARSCNView, context: Context) {}
 
     // MARK: - Coordinator
-    final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate {
-        weak var arView: ARSCNView?
-        let state: ARState
 
-        init(state: ARState) { self.state = state }
+    final class Coordinator: NSObject, ARSessionDelegate {
 
-        private var isPlaced = false
+        weak var scnView: ARSCNView?
+        let vm: ARViewModel
+        private var frameCounter = 0
 
-        
-        // head points, depth, and camera transform are all from the same snapshot.
-        private var latestVisionFrame: ARFrame?
+        init(vm: ARViewModel) { self.vm = vm }
 
-        private var latestHeadPoints: [CGPoint] = []
-        private var smoothedHeadPoints: [CGPoint] = []
-        private let headPointAlpha: CGFloat = 0.35
-
-        private var latestBoundingBoxes: [CGRect] = []
-        private var placedAnchor: ARAnchor?
-
-        let boxOverlayLayer  = CAShapeLayer()
-        let headOverlayLayer = CAShapeLayer()
-
-        private let visionQueue = DispatchQueue(label: "vision.queue", qos: .userInteractive)
-        private var visionBusy = false
-        private var lastVisionTime: CFTimeInterval = 0
-        private let visionHz: Double = 10.0
-
-        func configureOverlayLayers() {
-            boxOverlayLayer.fillColor   = UIColor.cyan.withAlphaComponent(0.08).cgColor
-            boxOverlayLayer.strokeColor = UIColor.cyan.cgColor
-            boxOverlayLayer.lineWidth   = 2.5
-            boxOverlayLayer.zPosition   = 1
-
-            headOverlayLayer.fillColor   = UIColor.red.withAlphaComponent(0.9).cgColor
-            headOverlayLayer.strokeColor = UIColor.white.cgColor
-            headOverlayLayer.lineWidth   = 1.5
-            headOverlayLayer.zPosition   = 2
-        }
-
-        // MARK: - ARSessionDelegate
+        // -----------------------------------------------------------------
+        // MARK: ARSessionDelegate
+        // -----------------------------------------------------------------
         func session(_ session: ARSession, didUpdate frame: ARFrame) {
-            let t = CACurrentMediaTime()
-            guard !visionBusy, t - lastVisionTime >= (1.0 / visionHz) else { return }
-            lastVisionTime = t
-            visionBusy = true
+            // Throttle to every 3rd frame
+            frameCounter = (frameCounter + 1) % 3
+            guard frameCounter == 0 else { return }
 
-            // Capture the exact frame so Vision results and placement use the same snapshot.
-            let visionFrame = frame
-            visionQueue.async { [weak self] in
-                self?.runVision(frame: visionFrame)
-            }
-        }
-
-        // MARK: - Vision
-        private func runVision(frame: ARFrame) {
-            defer { DispatchQueue.main.async { self.visionBusy = false } }
-
-            let poseReq = VNDetectHumanBodyPoseRequest() //For detecting head
-            let rectReq = VNDetectHumanRectanglesRequest() //For bounding box
-            rectReq.upperBodyOnly = false
-
-            let handler = VNImageRequestHandler(cvPixelBuffer: frame.capturedImage,
-                                                orientation: .right,
-                                                options: [:])
-            do { try handler.perform([poseReq, rectReq]) } catch {
-                print("Vision error:", error); return
-            }
-
-            let poseObs = (poseReq.results as? [VNHumanBodyPoseObservation]) ?? []
-            let rectObs = (rectReq.results as? [VNHumanObservation]) ?? []
-
-            let headPoints: [CGPoint] = poseObs.compactMap { obs in
-                for joint in [VNHumanBodyPoseObservation.JointName.nose, .leftEar, .rightEar, .neck] {
-                    if let pt = try? obs.recognizedPoint(joint), pt.confidence > 0.3 {
-                        return CGPoint(x: pt.x, y: pt.y)
-                    }
-                }
-                return nil
-            }
-
-            let boundingBoxes = rectObs.map { $0.boundingBox }
-
-            DispatchQueue.main.async { [weak self] in
+            // Run the heavy pixel loop on a background queue
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                 guard let self else { return }
-                // Store the frame alongside results so tap placement uses the same snapshot.
-                self.latestVisionFrame   = frame
-                self.latestHeadPoints    = self.smoothAllHeadPoints(headPoints)
-                self.latestBoundingBoxes = boundingBoxes
-                self.state.personDetected = !headPoints.isEmpty
-                self.state.detectedCount  = headPoints.count
-
-                if let v = self.arView {
-                    self.drawOverlays(headPoints: self.latestHeadPoints,
-                                      boundingBoxes: boundingBoxes,
-                                      in: v)
+                let result = self.extractPeople(from: frame)
+                let msg    = result.isEmpty
+                    ? "No people detected"
+                    : "\(result.count) person\(result.count == 1 ? "" : "s") detected"
+                DispatchQueue.main.async {
+                    self.vm.people        = result
+                    self.vm.statusMessage = msg
                 }
             }
         }
 
-        // MARK: - Draw overlays for debugging (bounding box and red dot for head)
-        private func drawOverlays(headPoints: [CGPoint], boundingBoxes: [CGRect], in view: ARSCNView) {
-            let vs = view.bounds.size
-
-            CATransaction.begin()
-            CATransaction.setDisableActions(true)
-            boxOverlayLayer.frame  = view.bounds
-            headOverlayLayer.frame = view.bounds
-            CATransaction.commit()
-
-            let boxPath = UIBezierPath()
-            for bbox in boundingBoxes {
-                let rect = CGRect(
-                    x:      bbox.minX * vs.width,
-                    y:      (1.0 - bbox.maxY) * vs.height,
-                    width:  bbox.width  * vs.width,
-                    height: bbox.height * vs.height
-                )
-                boxPath.append(UIBezierPath(roundedRect: rect, cornerRadius: 4))
-
-                let cornerLen: CGFloat = min(rect.width, rect.height) * 0.18
-                let inset: CGFloat = 1.5
-
-                boxPath.move(to: CGPoint(x: rect.minX + inset, y: rect.minY + cornerLen))
-                boxPath.addLine(to: CGPoint(x: rect.minX + inset, y: rect.minY + inset))
-                boxPath.addLine(to: CGPoint(x: rect.minX + cornerLen, y: rect.minY + inset))
-
-                boxPath.move(to: CGPoint(x: rect.maxX - cornerLen, y: rect.minY + inset))
-                boxPath.addLine(to: CGPoint(x: rect.maxX - inset, y: rect.minY + inset))
-                boxPath.addLine(to: CGPoint(x: rect.maxX - inset, y: rect.minY + cornerLen))
-
-                boxPath.move(to: CGPoint(x: rect.minX + inset, y: rect.maxY - cornerLen))
-                boxPath.addLine(to: CGPoint(x: rect.minX + inset, y: rect.maxY - inset))
-                boxPath.addLine(to: CGPoint(x: rect.minX + cornerLen, y: rect.maxY - inset))
-
-                boxPath.move(to: CGPoint(x: rect.maxX - cornerLen, y: rect.maxY - inset))
-                boxPath.addLine(to: CGPoint(x: rect.maxX - inset, y: rect.maxY - inset))
-                boxPath.addLine(to: CGPoint(x: rect.maxX - inset, y: rect.maxY - cornerLen))
-            }
-            boxOverlayLayer.path = boxPath.cgPath
-
-            let headPath = UIBezierPath()
-            for point in headPoints {
-                let screenPt = CGPoint(x: point.x * vs.width, y: (1.0 - point.y) * vs.height)
-                let radius: CGFloat = 8
-                headPath.move(to: CGPoint(x: screenPt.x + radius, y: screenPt.y))
-                headPath.addArc(withCenter: screenPt, radius: radius,
-                                startAngle: 0, endAngle: .pi * 2, clockwise: true)
-            }
-            headOverlayLayer.path = headPath.cgPath
+        func session(_ session: ARSession, didFailWithError error: Error) {
+            DispatchQueue.main.async { self.vm.statusMessage = "Error: \(error.localizedDescription)" }
+        }
+        func sessionWasInterrupted(_ session: ARSession) {
+            DispatchQueue.main.async { self.vm.statusMessage = "Interrupted" }
+        }
+        func sessionInterruptionEnded(_ session: ARSession) {
+            DispatchQueue.main.async { self.vm.statusMessage = "Resuming…" }
         }
 
-        // MARK: - Smooth head points
-        private func smoothAllHeadPoints(_ newPoints: [CGPoint]) -> [CGPoint] {
-            guard !smoothedHeadPoints.isEmpty else {
-                smoothedHeadPoints = newPoints; return newPoints
-            }
-            var result: [CGPoint] = []
-            var usedIndices = Set<Int>()
+        // -----------------------------------------------------------------
+        // MARK: Core extraction – reads segmentationBuffer + estimatedDepthData
+        // -----------------------------------------------------------------
+        private func extractPeople(from frame: ARFrame) -> [PersonDepthInfo] {
 
-            for new in newPoints {
-                var bestIdx: Int?
-                var bestDist = CGFloat.greatestFiniteMagnitude
-                for (i, prev) in smoothedHeadPoints.enumerated() {
-                    guard !usedIndices.contains(i) else { continue }
-                    let dist = hypot(new.x - prev.x, new.y - prev.y)
-                    if dist < bestDist { bestDist = dist; bestIdx = i }
+            guard let segBuffer   = frame.segmentationBuffer,
+                  let depthBuffer = frame.estimatedDepthData else {
+                DispatchQueue.main.async { self.vm.statusMessage = "Waiting for seg+depth…" }
+                return []
+            }
+
+            CVPixelBufferLockBaseAddress(segBuffer,   .readOnly)
+            CVPixelBufferLockBaseAddress(depthBuffer, .readOnly)
+            defer {
+                CVPixelBufferUnlockBaseAddress(segBuffer,   .readOnly)
+                CVPixelBufferUnlockBaseAddress(depthBuffer, .readOnly)
+            }
+
+            guard let segBase   = CVPixelBufferGetBaseAddress(segBuffer),
+                  let depthBase = CVPixelBufferGetBaseAddress(depthBuffer) else { return [] }
+
+            // Dimensions & strides
+            let segW        = CVPixelBufferGetWidth(segBuffer)
+            let segH        = CVPixelBufferGetHeight(segBuffer)
+            let depW        = CVPixelBufferGetWidth(depthBuffer)
+            let depH        = CVPixelBufferGetHeight(depthBuffer)
+            let segBPR      = CVPixelBufferGetBytesPerRow(segBuffer)
+            let depBPR      = CVPixelBufferGetBytesPerRow(depthBuffer)
+            let depthStride = depBPR / MemoryLayout<Float>.size
+
+            //create scale to match resolution
+            let xScale = Double(depW) / Double(segW)
+            let yScale = Double(depH) / Double(segH)
+
+            let segPtr   = segBase.assumingMemoryBound(to: UInt8.self)
+            let depthPtr = depthBase.assumingMemoryBound(to: Float.self)
+
+            struct Accum {
+                var depthSum: Double = 0
+                var depthMin: Float  =  .infinity
+                var depthMax: Float  = -.infinity
+                var count    = 0
+                var minX = Int.max, minY = Int.max
+                var maxX = Int.min, maxY = Int.min
+            }
+            var accums = [UInt8: Accum]()
+
+            for row in 0 ..< segH {
+                let rowBase = row * segBPR
+                for col in 0 ..< segW {
+                    let label = segPtr[rowBase + col]
+                    guard label > 0 else { continue }
+
+                    let dc    = min(Int(Double(col) * xScale), depW - 1)
+                    let dr    = min(Int(Double(row) * yScale), depH - 1)
+                    let depth = depthPtr[dr * depthStride + dc]
+                    guard depth.isFinite, depth > 0 else { continue }
+
+                    var a = accums[label, default: Accum()]
+                    a.depthSum += Double(depth)
+                    a.depthMin  = min(a.depthMin, depth)
+                    a.depthMax  = max(a.depthMax, depth)
+                    a.count    += 1
+                    if col < a.minX { a.minX = col }
+                    if col > a.maxX { a.maxX = col }
+                    if row < a.minY { a.minY = row }
+                    if row > a.maxY { a.maxY = row }
+                    accums[label] = a
                 }
-                if let idx = bestIdx, bestDist < 0.15 {
-                    let prev = smoothedHeadPoints[idx]
-                    result.append(CGPoint(x: prev.x + headPointAlpha * (new.x - prev.x),
-                                          y: prev.y + headPointAlpha * (new.y - prev.y)))
-                    usedIndices.insert(idx)
-                } else {
-                    result.append(new)
+            }
+
+            return accums
+                .sorted { $0.key < $1.key }
+                .compactMap { label, a in
+                    guard a.count > 50 else { return nil }
+                    let normRect = CGRect(
+                        x:      CGFloat(a.minX) / CGFloat(segW),
+                        y:      CGFloat(a.minY) / CGFloat(segH),
+                        width:  CGFloat(a.maxX - a.minX) / CGFloat(segW),
+                        height: CGFloat(a.maxY - a.minY) / CGFloat(segH)
+                    )
+                    return PersonDepthInfo(
+                        id:           Int(label),
+                        averageDepth: Float(a.depthSum / Double(a.count)),
+                        minDepth:     a.depthMin,
+                        maxDepth:     a.depthMax,
+                        pixelCount:   a.count,
+                        normRect:     normRect
+                    )
+                }
+        }
+    }
+}
+
+// MARK: - Depth colour  (green = close → red = far, 0–8 m)
+
+private func depthColor(_ metres: Float) -> Color {
+    let t = Double(min(metres / 8.0, 1.0))
+    return Color(hue: (1.0 - t) * 0.35, saturation: 1, brightness: 1)
+}
+
+// MARK: - Dot overlay
+
+struct PersonDotOverlay: View {
+    let people: [PersonDepthInfo]
+
+    var body: some View {
+        GeometryReader { geo in
+            ForEach(people) { person in
+                let r  = person.normRect
+                let cx = r.midX  * geo.size.width
+                // Place dot just above the top edge of the bounding box
+                let cy = (r.minY * geo.size.height) - 40
+                let c  = depthColor(person.averageDepth)
+
+                ZStack {
+                    // Outer glow ring
+                    Circle().fill(c.opacity(0.25)).frame(width: 48, height: 48)
+                    // Solid core
+                    Circle().fill(c).frame(width: 22, height: 22)
+                        .shadow(color: c.opacity(0.9), radius: 8)
+                    // Distance label below the dot
+                    Text(String(format: "%.1fm", person.averageDepth))
+                        .font(.system(size: 11, weight: .black, design: .monospaced))
+                        .foregroundColor(.white)
+                        .shadow(color: .black.opacity(0.8), radius: 2)
+                        .offset(y: 30)
+                }
+                .position(x: cx, y: max(cy, 40))
+            }
+        }
+    }
+}
+
+// MARK: - ContentView
+
+struct ContentView: View {
+    @StateObject private var vm = ARViewModel()
+
+    var body: some View {
+        ZStack(alignment: .bottom) {
+
+            ARCameraView(vm: vm)
+                .ignoresSafeArea()
+
+            PersonDotOverlay(people: vm.people)
+                .ignoresSafeArea()
+
+            VStack(spacing: 0) {
+
+                HStack(spacing: 8) {
+                    Image(systemName: vm.people.isEmpty ? "person.slash.fill" : "person.2.fill")
+                        .foregroundColor(vm.people.isEmpty ? .gray : .green)
+                    Text(vm.statusMessage)
+                        .font(.subheadline.bold())
+                        .foregroundColor(.white)
+                    Spacer()
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 10)
+                .background(.ultraThinMaterial)
+
+                if !vm.people.isEmpty {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 10) {
+                            ForEach(vm.people) { person in
+                                PersonChip(person: person)
+                            }
+                        }
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 10)
+                    }
+                    .background(.ultraThinMaterial)
                 }
             }
-            smoothedHeadPoints = result
-            return result
         }
+    }
+}
 
-        // MARK: - Tap to place
-        @objc func handleTap(_ gesture: UITapGestureRecognizer) {
-            guard !isPlaced,
-                  let frame = latestVisionFrame,   // same frame Vision ran on
-                  !latestHeadPoints.isEmpty,
-                  let view = arView
-            else { return }
+// MARK: - PersonChip
 
-            let tapPt    = gesture.location(in: view)
-            let viewSize = view.bounds.size
+private struct PersonChip: View {
+    let person: PersonDepthInfo
+    private var c: Color { depthColor(person.averageDepth) }
 
-            // Find the head point closest to the tap
-            let targetHead = latestHeadPoints.min(by: { a, b in
-                let aS = CGPoint(x: a.x * viewSize.width, y: (1.0 - a.y) * viewSize.height)
-                let bS = CGPoint(x: b.x * viewSize.width, y: (1.0 - b.y) * viewSize.height)
-                return hypot(aS.x - tapPt.x, aS.y - tapPt.y) < hypot(bS.x - tapPt.x, bS.y - tapPt.y)
-            })!
-
-            // Convert head point to raw landscape pixel coords.
-            // Vision ran with .right orientation so its normalized x/y axes are rotated:
-            //   raw pixel X = (1 - head.y) * imgW
-            //   raw pixel Y = head.x       * imgH
-            let imgW = CVPixelBufferGetWidth(frame.capturedImage)
-            let imgH = CVPixelBufferGetHeight(frame.capturedImage)
-            let u = (1.0 - Float(targetHead.y)) * Float(imgW - 1)
-            let v = Float(targetHead.x) * Float(imgH - 1)
-
-            // Sample depth at the head pixel
-            let depthPB = frame.smoothedSceneDepth?.depthMap ?? frame.sceneDepth?.depthMap
-            guard let depth = depthPB.flatMap({ sampleDepthMeters($0, uImage: u, vImage: v,
-                                                                   imageW: imgW, imageH: imgH) }) else {
-                print("FAILED — no depth available")
-                return
+    var body: some View {
+        HStack(spacing: 8) {
+            Circle().fill(c).frame(width: 10, height: 10)
+                .shadow(color: c.opacity(0.8), radius: 4)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Person \(person.id)")
+                    .font(.caption2.bold()).foregroundColor(.white)
+                Text(String(format: "%.2f m", person.averageDepth))
+                    .font(.system(size: 15, weight: .bold, design: .monospaced))
+                    .foregroundColor(c)
+                Text(String(format: "%.1f – %.1f m", person.minDepth, person.maxDepth))
+                    .font(.caption2).foregroundColor(.white.opacity(0.5))
             }
-
-            // Unproject head pixel + depth to get the world position
-            let worldPos = unprojectToWorld(u: u, v: v, depth: depth, camera: frame.camera)
-            print("Placing at head world pos: \(worldPos)")
-            placeAnchor(at: worldPos, view: view)
         }
-
-        // MARK: - Placement
-        private func placeAnchor(at position: SIMD3<Float>, view: ARSCNView) {
-            var t = matrix_identity_float4x4
-            t.columns.3 = SIMD4<Float>(position.x, position.y, position.z, 1.0)
-            let anchor = ARAnchor(transform: t)
-            placedAnchor = anchor
-            view.session.add(anchor: anchor)
-            isPlaced = true
-            print("Anchor placed at: \(t.columns.3)")
-            DispatchQueue.main.async { self.state.isPlaced = true }
-        }
-
-        // MARK: - Render anchor
-        func renderer(_ renderer: SCNSceneRenderer, didAdd node: SCNNode, for anchor: ARAnchor) {
-            guard anchor.identifier == placedAnchor?.identifier else { return }
-
-            let plane = SCNPlane(width: 0.3, height: 0.3)
-            let mat   = SCNMaterial()
-            mat.diffuse.contents     = UIImage(named: "placement_image")
-            mat.isDoubleSided        = true
-            mat.readsFromDepthBuffer = true
-            mat.writesToDepthBuffer  = true
-            plane.materials = [mat]
-
-            let planeNode = SCNNode(geometry: plane)
-            planeNode.name = "PlacedPlane"
-            let billboard = SCNBillboardConstraint()
-            billboard.freeAxes = .all
-            planeNode.constraints = [billboard]
-            node.addChildNode(planeNode)
-            print("Plane attached to anchor node")
-        }
-
-        // MARK: - Depth sampling (5×5 median)
-        private func sampleDepthMeters(_ depthPB: CVPixelBuffer,
-                                       uImage: Float, vImage: Float,
-                                       imageW: Int, imageH: Int) -> Float? {
-            CVPixelBufferLockBaseAddress(depthPB, .readOnly)
-            defer { CVPixelBufferUnlockBaseAddress(depthPB, .readOnly) }
-
-            let dW = CVPixelBufferGetWidth(depthPB)
-            let dH = CVPixelBufferGetHeight(depthPB)
-            let x  = Int(round((uImage / Float(imageW)) * Float(dW - 1)))
-            let y  = Int(round((vImage / Float(imageH)) * Float(dH - 1)))
-
-            guard let base = CVPixelBufferGetBaseAddress(depthPB) else { return nil }
-            let ptr     = base.assumingMemoryBound(to: Float32.self)
-            let strideF = CVPixelBufferGetBytesPerRow(depthPB) / MemoryLayout<Float32>.stride
-
-            func depthAt(_ xx: Int, _ yy: Int) -> Float? {
-                guard xx >= 0, xx < dW, yy >= 0, yy < dH else { return nil }
-                let z = Float(ptr[(yy * strideF) + xx])
-                return (z.isFinite && z >= 0.05 && z <= 20.0) ? z : nil
-            }
-
-            var samples = [Float]()
-            samples.reserveCapacity(25)
-            for dy in -2...2 { for dx in -2...2 { if let z = depthAt(x+dx, y+dy) { samples.append(z) } } }
-            guard !samples.isEmpty else { return nil }
-            samples.sort()
-            return samples[samples.count / 2]
-        }
-
-        // MARK: - Unproject
-        private func unprojectToWorld(u: Float, v: Float,
-                                      depth: Float, camera: ARCamera) -> SIMD3<Float> {
-            let K  = camera.intrinsics
-            let fx = K.columns.0.x, fy = K.columns.1.y
-            let cx = K.columns.2.x, cy = K.columns.2.y
-            let pCam   = SIMD4<Float>((u - cx) / fx * depth, -(v - cy) / fy * depth, -depth, 1.0)
-            let pWorld = simd_mul(camera.transform, pCam)
-            return SIMD3<Float>(pWorld.x, pWorld.y, pWorld.z)
-        }
+        .padding(.horizontal, 12).padding(.vertical, 8)
+        .background(Color.black.opacity(0.45))
+        .cornerRadius(12)
+        .overlay(RoundedRectangle(cornerRadius: 12).stroke(c.opacity(0.6), lineWidth: 1))
     }
 }
