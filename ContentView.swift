@@ -1,6 +1,7 @@
 import SwiftUI
 import ARKit
 import SceneKit
+import Vision
 import Combine
 
 // MARK: - Data Model
@@ -52,7 +53,7 @@ struct ARCameraView: UIViewRepresentable {
         scnView.session.run(config, options: [.resetTracking, .removeExistingAnchors])
 
         DispatchQueue.main.async {
-            self.vm.isRunning    = true
+            self.vm.isRunning = true
             self.vm.statusMessage = "Running * point at people"
         }
 
@@ -67,28 +68,72 @@ struct ARCameraView: UIViewRepresentable {
 
         weak var scnView: ARSCNView?
         let vm: ARViewModel
-        private var frameCounter = 0
 
-        init(vm: ARViewModel) { self.vm = vm }
+        private var frameCounter = 0
+        private let visionQueue = DispatchQueue(label: "vision.queue", qos: .userInitiated)
+        private let humanRequest: VNDetectHumanRectanglesRequest
+        private var isProcessingFrame = false
+        private var nextTrackedID = 0
+
+        private struct TrackedPerson {
+            let id: Int
+            let rect: CGRect
+        }
+
+        private var previousTrackedPeople: [TrackedPerson] = []
+
+        init(vm: ARViewModel) {
+            self.vm = vm
+            let request = VNDetectHumanRectanglesRequest()
+            request.upperBodyOnly = false
+            self.humanRequest = request
+            super.init()
+        }
 
         // -----------------------------------------------------------------
         // MARK: ARSessionDelegate
         // -----------------------------------------------------------------
         func session(_ session: ARSession, didUpdate frame: ARFrame) {
-            // Throttle to every 3rd frame
             frameCounter = (frameCounter + 1) % 3
             guard frameCounter == 0 else { return }
+            guard !isProcessingFrame else { return }
 
-            // Run the heavy pixel loop on a background queue
-            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                guard let self else { return }
-                let result = self.extractPeople(from: frame)
-                let msg    = result.isEmpty
-                    ? "No people detected"
-                    : "\(result.count) person\(result.count == 1 ? "" : "s") detected"
+            guard frame.segmentationBuffer != nil,
+                  frame.estimatedDepthData != nil else {
                 DispatchQueue.main.async {
-                    self.vm.people        = result
-                    self.vm.statusMessage = msg
+                    self.vm.statusMessage = "Waiting for seg+depth…"
+                }
+                return
+            }
+
+            isProcessingFrame = true
+
+            visionQueue.async { [weak self] in
+                guard let self else { return }
+                defer { self.isProcessingFrame = false }
+
+                let handler = VNImageRequestHandler(
+                    cvPixelBuffer: frame.capturedImage,
+                    orientation: .right,
+                    options: [:]
+                )
+
+                do {
+                    try handler.perform([self.humanRequest])
+                    let observations = (self.humanRequest.results as? [VNHumanObservation]) ?? []
+                    let result = self.extractPeople(from: frame, observations: observations)
+                    let msg = result.isEmpty
+                        ? "No people detected"
+                        : "\(result.count) person\(result.count == 1 ? "" : "s") detected"
+
+                    DispatchQueue.main.async {
+                        self.vm.people = result
+                        self.vm.statusMessage = msg
+                    }
+                } catch {
+                    DispatchQueue.main.async {
+                        self.vm.statusMessage = "Vision error: \(error.localizedDescription)"
+                    }
                 }
             }
         }
@@ -96,103 +141,157 @@ struct ARCameraView: UIViewRepresentable {
         func session(_ session: ARSession, didFailWithError error: Error) {
             DispatchQueue.main.async { self.vm.statusMessage = "Error: \(error.localizedDescription)" }
         }
+
         func sessionWasInterrupted(_ session: ARSession) {
             DispatchQueue.main.async { self.vm.statusMessage = "Interrupted" }
         }
+
         func sessionInterruptionEnded(_ session: ARSession) {
             DispatchQueue.main.async { self.vm.statusMessage = "Resuming…" }
         }
 
         // -----------------------------------------------------------------
-        // MARK: Core extraction – reads segmentationBuffer + estimatedDepthData
+        // MARK: Core extraction – Vision rectangles + segmentationBuffer + estimatedDepthData
         // -----------------------------------------------------------------
-        private func extractPeople(from frame: ARFrame) -> [PersonDepthInfo] {
-
-            guard let segBuffer   = frame.segmentationBuffer,
+        private func extractPeople(from frame: ARFrame, observations: [VNHumanObservation]) -> [PersonDepthInfo] {
+            guard let segBuffer = frame.segmentationBuffer,
                   let depthBuffer = frame.estimatedDepthData else {
-                DispatchQueue.main.async { self.vm.statusMessage = "Waiting for seg+depth…" }
                 return []
             }
 
-            CVPixelBufferLockBaseAddress(segBuffer,   .readOnly)
+            CVPixelBufferLockBaseAddress(segBuffer, .readOnly)
             CVPixelBufferLockBaseAddress(depthBuffer, .readOnly)
             defer {
-                CVPixelBufferUnlockBaseAddress(segBuffer,   .readOnly)
+                CVPixelBufferUnlockBaseAddress(segBuffer, .readOnly)
                 CVPixelBufferUnlockBaseAddress(depthBuffer, .readOnly)
             }
 
-            guard let segBase   = CVPixelBufferGetBaseAddress(segBuffer),
-                  let depthBase = CVPixelBufferGetBaseAddress(depthBuffer) else { return [] }
-
-            // Dimensions & strides
-            let segW        = CVPixelBufferGetWidth(segBuffer)
-            let segH        = CVPixelBufferGetHeight(segBuffer)
-            let depW        = CVPixelBufferGetWidth(depthBuffer)
-            let depH        = CVPixelBufferGetHeight(depthBuffer)
-            let segBPR      = CVPixelBufferGetBytesPerRow(segBuffer)
-            let depBPR      = CVPixelBufferGetBytesPerRow(depthBuffer)
-            let depthStride = depBPR / MemoryLayout<Float>.size
-
-            //create scale to match resolution
-            let xScale = Double(depW) / Double(segW)
-            let yScale = Double(depH) / Double(segH)
-
-            let segPtr   = segBase.assumingMemoryBound(to: UInt8.self)
-            let depthPtr = depthBase.assumingMemoryBound(to: Float.self)
-
-            struct Accum {
-                var depthSum: Double = 0
-                var depthMin: Float  =  .infinity
-                var depthMax: Float  = -.infinity
-                var count    = 0
-                var minX = Int.max, minY = Int.max
-                var maxX = Int.min, maxY = Int.min
-            }
-            var accums = [UInt8: Accum]()
-
-            for row in 0 ..< segH {
-                let rowBase = row * segBPR
-                for col in 0 ..< segW {
-                    let label = segPtr[rowBase + col]
-                    guard label > 0 else { continue }
-
-                    let dc    = min(Int(Double(col) * xScale), depW - 1)
-                    let dr    = min(Int(Double(row) * yScale), depH - 1)
-                    let depth = depthPtr[dr * depthStride + dc]
-                    guard depth.isFinite, depth > 0 else { continue }
-
-                    var a = accums[label, default: Accum()]
-                    a.depthSum += Double(depth)
-                    a.depthMin  = min(a.depthMin, depth)
-                    a.depthMax  = max(a.depthMax, depth)
-                    a.count    += 1
-                    if col < a.minX { a.minX = col }
-                    if col > a.maxX { a.maxX = col }
-                    if row < a.minY { a.minY = row }
-                    if row > a.maxY { a.maxY = row }
-                    accums[label] = a
-                }
+            guard let segBase = CVPixelBufferGetBaseAddress(segBuffer),
+                  let depthBase = CVPixelBufferGetBaseAddress(depthBuffer) else {
+                return []
             }
 
-            return accums
-                .sorted { $0.key < $1.key }
-                .compactMap { label, a in
-                    guard a.count > 50 else { return nil }
-                    let normRect = CGRect(
-                        x:      CGFloat(a.minX) / CGFloat(segW),
-                        y:      CGFloat(a.minY) / CGFloat(segH),
-                        width:  CGFloat(a.maxX - a.minX) / CGFloat(segW),
-                        height: CGFloat(a.maxY - a.minY) / CGFloat(segH)
-                    )
-                    return PersonDepthInfo(
-                        id:           Int(label),
-                        averageDepth: Float(a.depthSum / Double(a.count)),
-                        minDepth:     a.depthMin,
-                        maxDepth:     a.depthMax,
-                        pixelCount:   a.count,
-                        normRect:     normRect
-                    )
+            let segW = CVPixelBufferGetWidth(segBuffer)
+            let segH = CVPixelBufferGetHeight(segBuffer)
+            let segBPR = CVPixelBufferGetBytesPerRow(segBuffer)
+
+            let depW = CVPixelBufferGetWidth(depthBuffer)
+            let depH = CVPixelBufferGetHeight(depthBuffer)
+            let depBPR = CVPixelBufferGetBytesPerRow(depthBuffer)
+            let depthStride = depBPR / MemoryLayout<Float32>.size
+
+            let xScale = Float(depW) / Float(segW)
+            let yScale = Float(depH) / Float(segH)
+
+            let segPtr = segBase.assumingMemoryBound(to: UInt8.self)
+            let depthPtr = depthBase.assumingMemoryBound(to: Float32.self)
+
+            var rawPeople: [(rect: CGRect, avg: Float, min: Float, max: Float, count: Int)] = []
+
+            for obs in observations {
+                let bbox = obs.boundingBox
+
+                let minX = max(0, Int(bbox.minX * CGFloat(segW)))
+                let maxX = min(segW - 1, Int(bbox.maxX * CGFloat(segW)))
+
+                let minYVision = max(0, Int(bbox.minY * CGFloat(segH)))
+                let maxYVision = min(segH - 1, Int(bbox.maxY * CGFloat(segH)))
+
+                // Vision bbox uses bottom-left origin; CVPixelBuffer uses top-left origin.
+                let minY = segH - 1 - maxYVision
+                let maxY = segH - 1 - minYVision
+
+                guard minX <= maxX, minY <= maxY else { continue }
+
+                var depthValues: [Float] = []
+                depthValues.reserveCapacity(max(100, (maxX - minX + 1) * (maxY - minY + 1) / 5))
+
+                for row in minY...maxY {
+                    let rowBase = row * segBPR
+
+                    for col in minX...maxX {
+                        let segValue = segPtr[rowBase + col]
+                        guard segValue != 0 else { continue }
+
+                        let dc = min(depW - 1, Int(Float(col) * xScale))
+                        let dr = min(depH - 1, Int(Float(row) * yScale))
+                        let depth = depthPtr[dr * depthStride + dc]
+
+                        guard depth.isFinite, depth > 0 else { continue }
+                        depthValues.append(depth)
+                    }
                 }
+
+                guard depthValues.count > 50 else { continue }
+
+                depthValues.sort()
+                let count = depthValues.count
+                let median = depthValues[count / 2]
+                let minDepth = depthValues.first ?? median
+                let maxDepth = depthValues.last ?? median
+
+                rawPeople.append((
+                    rect: bbox,
+                    avg: median,
+                    min: minDepth,
+                    max: maxDepth,
+                    count: count
+                ))
+            }
+
+            return assignStableIDs(to: rawPeople)
+        }
+
+        private func assignStableIDs(
+            to rawPeople: [(rect: CGRect, avg: Float, min: Float, max: Float, count: Int)]
+        ) -> [PersonDepthInfo] {
+            var results: [PersonDepthInfo] = []
+            var newTracked: [TrackedPerson] = []
+            var usedPreviousIDs = Set<Int>()
+
+            for person in rawPeople {
+                let center = CGPoint(x: person.rect.midX, y: person.rect.midY)
+
+                var bestID: Int?
+                var bestDistance = CGFloat.greatestFiniteMagnitude
+
+                for prev in previousTrackedPeople where !usedPreviousIDs.contains(prev.id) {
+                    let prevCenter = CGPoint(x: prev.rect.midX, y: prev.rect.midY)
+                    let dx = center.x - prevCenter.x
+                    let dy = center.y - prevCenter.y
+                    let dist = sqrt(dx * dx + dy * dy)
+
+                    if dist < bestDistance, dist < 0.12 {
+                        bestDistance = dist
+                        bestID = prev.id
+                    }
+                }
+
+                let assignedID: Int
+                if let id = bestID {
+                    assignedID = id
+                    usedPreviousIDs.insert(id)
+                } else {
+                    assignedID = nextTrackedID
+                    nextTrackedID += 1
+                }
+
+                newTracked.append(TrackedPerson(id: assignedID, rect: person.rect))
+
+                results.append(
+                    PersonDepthInfo(
+                        id: assignedID,
+                        averageDepth: person.avg,
+                        minDepth: person.min,
+                        maxDepth: person.max,
+                        pixelCount: person.count,
+                        normRect: person.rect
+                    )
+                )
+            }
+
+            previousTrackedPeople = newTracked
+            return results.sorted { $0.id < $1.id }
         }
     }
 }
@@ -212,19 +311,15 @@ struct PersonDotOverlay: View {
     var body: some View {
         GeometryReader { geo in
             ForEach(people) { person in
-                let r  = person.normRect
-                let cx = r.midX  * geo.size.width
-                // Place dot just above the top edge of the bounding box
+                let r = person.normRect
+                let cx = r.midX * geo.size.width
                 let cy = (r.minY * geo.size.height) - 40
-                let c  = depthColor(person.averageDepth)
+                let c = depthColor(person.averageDepth)
 
                 ZStack {
-                    // Outer glow ring
                     Circle().fill(c.opacity(0.25)).frame(width: 48, height: 48)
-                    // Solid core
                     Circle().fill(c).frame(width: 22, height: 22)
                         .shadow(color: c.opacity(0.9), radius: 8)
-                    // Distance label below the dot
                     Text(String(format: "%.1fm", person.averageDepth))
                         .font(.system(size: 11, weight: .black, design: .monospaced))
                         .foregroundColor(.white)
@@ -244,7 +339,6 @@ struct ContentView: View {
 
     var body: some View {
         ZStack(alignment: .bottom) {
-
             ARCameraView(vm: vm)
                 .ignoresSafeArea()
 
@@ -252,7 +346,6 @@ struct ContentView: View {
                 .ignoresSafeArea()
 
             VStack(spacing: 0) {
-
                 HStack(spacing: 8) {
                     Image(systemName: vm.people.isEmpty ? "person.slash.fill" : "person.2.fill")
                         .foregroundColor(vm.people.isEmpty ? .gray : .green)
