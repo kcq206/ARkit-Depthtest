@@ -2,6 +2,7 @@ import SwiftUI
 import ARKit
 import SceneKit
 import Vision
+import UIKit
 import Combine
 
 // MARK: - Data Model
@@ -23,29 +24,163 @@ final class ARViewModel: ObservableObject {
     @Published var isRunning = false
 }
 
-// MARK: - UIViewRepresentable  (owns the ARSCNView + ARSession + delegate)
+// MARK: - Overlay
+
+final class PersonBoundingBoxOverlayView: UIView {
+    private var dotViews: [Int: UIView] = [:]
+    private var textLabels: [Int: UILabel] = [:]
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        isUserInteractionEnabled = false
+        backgroundColor = .clear
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    func updatePeople(_ people: [PersonDepthInfo]) {
+        let activeIDs = Set(people.map { $0.id })
+
+        for (id, view) in dotViews where !activeIDs.contains(id) {
+            view.removeFromSuperview()
+            dotViews.removeValue(forKey: id)
+        }
+
+        for (id, label) in textLabels where !activeIDs.contains(id) {
+            label.removeFromSuperview()
+            textLabels.removeValue(forKey: id)
+        }
+
+        for person in people {
+            let frame = visionRectToUIKitRect(person.normRect, in: bounds)
+
+            let offsetFactor: CGFloat = 0.1
+            let offset = frame.height * offsetFactor
+            let rawY = frame.minY - offset
+
+            let center = CGPoint(
+                x: frame.midX,
+                y: max(10, rawY)
+            )
+
+            let dotSize: CGFloat = 14
+
+            let dotView: UIView
+            if let existing = dotViews[person.id] {
+                dotView = existing
+            } else {
+                let v = UIView()
+                v.layer.cornerRadius = dotSize / 2
+                v.layer.borderWidth = 2
+                addSubview(v)
+                dotViews[person.id] = v
+                dotView = v
+            }
+
+            let color = uiColor(for: person.averageDepth)
+            dotView.backgroundColor = color
+            dotView.layer.borderColor = UIColor.white.cgColor
+
+            dotView.frame = CGRect(
+                x: center.x - dotSize / 2,
+                y: center.y - dotSize / 2,
+                width: dotSize,
+                height: dotSize
+            )
+
+            let label: UILabel
+            if let existing = textLabels[person.id] {
+                label = existing
+            } else {
+                let l = UILabel()
+                l.font = .monospacedSystemFont(ofSize: 12, weight: .bold)
+                l.textColor = .white
+                l.backgroundColor = UIColor.black.withAlphaComponent(0.65)
+                l.layer.cornerRadius = 6
+                l.layer.masksToBounds = true
+                l.textAlignment = .center
+                addSubview(l)
+                textLabels[person.id] = l
+                label = l
+            }
+
+            label.text = "P\(person.id)  \(String(format: "%.1fm", person.averageDepth))"
+            label.sizeToFit()
+
+            label.frame = CGRect(
+                x: center.x - (label.bounds.width + 12) / 2,
+                y: max(0, center.y - dotSize / 2 - 30),
+                width: label.bounds.width + 12,
+                height: 22
+            )
+        }
+    }
+
+    private func visionRectToUIKitRect(_ rect: CGRect, in bounds: CGRect) -> CGRect {
+        CGRect(
+            x: rect.minX * bounds.width,
+            y: (1.0 - rect.maxY) * bounds.height,
+            width: rect.width * bounds.width,
+            height: rect.height * bounds.height
+        )
+    }
+
+    private func uiColor(for metres: Float) -> UIColor {
+        let t = CGFloat(min(max(metres / 8.0, 0), 1))
+        return UIColor(hue: (1.0 - t) * 0.35, saturation: 1.0, brightness: 1.0, alpha: 1.0)
+    }
+}
+
+// MARK: - Container
+
+final class ARContainerView: UIView {
+    let sceneView = ARSCNView()
+    let overlayView = PersonBoundingBoxOverlayView()
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+
+        sceneView.frame = bounds
+        sceneView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        addSubview(sceneView)
+
+        overlayView.frame = bounds
+        overlayView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        addSubview(overlayView)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+}
+
+// MARK: - AR View
 
 struct ARCameraView: UIViewRepresentable {
-
     @ObservedObject var vm: ARViewModel
 
     func makeCoordinator() -> Coordinator {
         Coordinator(vm: vm)
     }
 
-    func makeUIView(context: Context) -> ARSCNView {
-        let scnView = ARSCNView()
+    func makeUIView(context: Context) -> ARContainerView {
+        let container = ARContainerView()
+        let scnView = container.sceneView
+
         scnView.scene = SCNScene()
         scnView.automaticallyUpdatesLighting = true
 
         scnView.session.delegate = context.coordinator
         context.coordinator.scnView = scnView
+        context.coordinator.overlayView = container.overlayView
 
         guard ARWorldTrackingConfiguration.supportsFrameSemantics(.personSegmentationWithDepth) else {
             DispatchQueue.main.async {
-                self.vm.statusMessage = "⚠️ Device does not support person segmentation with depth"
+                vm.statusMessage = "⚠️ Device does not support person segmentation with depth"
             }
-            return scnView
+            return container
         }
 
         let config = ARWorldTrackingConfiguration()
@@ -53,34 +188,26 @@ struct ARCameraView: UIViewRepresentable {
         scnView.session.run(config, options: [.resetTracking, .removeExistingAnchors])
 
         DispatchQueue.main.async {
-            self.vm.isRunning = true
-            self.vm.statusMessage = "Running * point at people"
+            vm.isRunning = true
+            vm.statusMessage = "Running"
         }
 
-        return scnView
+        return container
     }
 
-    func updateUIView(_ uiView: ARSCNView, context: Context) {}
-
-    // MARK: - Coordinator
+    func updateUIView(_ uiView: ARContainerView, context: Context) {
+        uiView.overlayView.updatePeople(vm.people)
+    }
 
     final class Coordinator: NSObject, ARSessionDelegate {
-
         weak var scnView: ARSCNView?
+        weak var overlayView: PersonBoundingBoxOverlayView?
         let vm: ARViewModel
 
-        private var frameCounter = 0
         private let visionQueue = DispatchQueue(label: "vision.queue", qos: .userInitiated)
         private let humanRequest: VNDetectHumanRectanglesRequest
-        private var isProcessingFrame = false
-        private var nextTrackedID = 0
-
-        private struct TrackedPerson {
-            let id: Int
-            let rect: CGRect
-        }
-
-        private var previousTrackedPeople: [TrackedPerson] = []
+        private var isProcessing = false
+        private var frameCounter = 0
 
         init(vm: ARViewModel) {
             self.vm = vm
@@ -90,27 +217,29 @@ struct ARCameraView: UIViewRepresentable {
             super.init()
         }
 
-        // -----------------------------------------------------------------
-        // MARK: ARSessionDelegate
-        // -----------------------------------------------------------------
         func session(_ session: ARSession, didUpdate frame: ARFrame) {
-            frameCounter = (frameCounter + 1) % 3
-            guard frameCounter == 0 else { return }
-            guard !isProcessingFrame else { return }
+            frameCounter += 1
+
+            guard !isProcessing else { return }
+
+            // Process every 4th frame
+            if frameCounter % 4 != 0 { return }
 
             guard frame.segmentationBuffer != nil,
                   frame.estimatedDepthData != nil else {
                 DispatchQueue.main.async {
                     self.vm.statusMessage = "Waiting for seg+depth…"
+                    self.vm.people = []
+                    self.overlayView?.updatePeople([])
                 }
                 return
             }
 
-            isProcessingFrame = true
+            isProcessing = true
 
             visionQueue.async { [weak self] in
                 guard let self else { return }
-                defer { self.isProcessingFrame = false }
+                defer { self.isProcessing = false }
 
                 let handler = VNImageRequestHandler(
                     cvPixelBuffer: frame.capturedImage,
@@ -121,38 +250,27 @@ struct ARCameraView: UIViewRepresentable {
                 do {
                     try handler.perform([self.humanRequest])
                     let observations = (self.humanRequest.results as? [VNHumanObservation]) ?? []
-                    let result = self.extractPeople(from: frame, observations: observations)
-                    let msg = result.isEmpty
+                    let people = self.extractPeople(from: frame, observations: observations)
+
+                    let msg = people.isEmpty
                         ? "No people detected"
-                        : "\(result.count) person\(result.count == 1 ? "" : "s") detected"
+                        : "\(people.count) person\(people.count == 1 ? "" : "s") detected"
 
                     DispatchQueue.main.async {
-                        self.vm.people = result
+                        self.vm.people = people
                         self.vm.statusMessage = msg
+                        self.overlayView?.updatePeople(people)
                     }
                 } catch {
                     DispatchQueue.main.async {
                         self.vm.statusMessage = "Vision error: \(error.localizedDescription)"
+                        self.vm.people = []
+                        self.overlayView?.updatePeople([])
                     }
                 }
             }
         }
 
-        func session(_ session: ARSession, didFailWithError error: Error) {
-            DispatchQueue.main.async { self.vm.statusMessage = "Error: \(error.localizedDescription)" }
-        }
-
-        func sessionWasInterrupted(_ session: ARSession) {
-            DispatchQueue.main.async { self.vm.statusMessage = "Interrupted" }
-        }
-
-        func sessionInterruptionEnded(_ session: ARSession) {
-            DispatchQueue.main.async { self.vm.statusMessage = "Resuming…" }
-        }
-
-        // -----------------------------------------------------------------
-        // MARK: Core extraction – Vision rectangles + segmentationBuffer + estimatedDepthData
-        // -----------------------------------------------------------------
         private func extractPeople(from frame: ARFrame, observations: [VNHumanObservation]) -> [PersonDepthInfo] {
             guard let segBuffer = frame.segmentationBuffer,
                   let depthBuffer = frame.estimatedDepthData else {
@@ -186,9 +304,9 @@ struct ARCameraView: UIViewRepresentable {
             let segPtr = segBase.assumingMemoryBound(to: UInt8.self)
             let depthPtr = depthBase.assumingMemoryBound(to: Float32.self)
 
-            var rawPeople: [(rect: CGRect, avg: Float, min: Float, max: Float, count: Int)] = []
+            var people: [PersonDepthInfo] = []
 
-            for obs in observations {
+            for (index, obs) in observations.enumerated() {
                 let bbox = obs.boundingBox
 
                 let minX = max(0, Int(bbox.minX * CGFloat(segW)))
@@ -197,14 +315,18 @@ struct ARCameraView: UIViewRepresentable {
                 let minYVision = max(0, Int(bbox.minY * CGFloat(segH)))
                 let maxYVision = min(segH - 1, Int(bbox.maxY * CGFloat(segH)))
 
-                // Vision bbox uses bottom-left origin; CVPixelBuffer uses top-left origin.
                 let minY = segH - 1 - maxYVision
                 let maxY = segH - 1 - minYVision
 
                 guard minX <= maxX, minY <= maxY else { continue }
 
-                var depthValues: [Float] = []
-                depthValues.reserveCapacity(max(100, (maxX - minX + 1) * (maxY - minY + 1) / 5))
+                let sampleEvery = 8
+                var sampledDepths: [Float] = []
+                sampledDepths.reserveCapacity(128)
+
+                var validPixelCount = 0
+                var minDepthSeen = Float.greatestFiniteMagnitude
+                var maxDepthSeen: Float = 0
 
                 for row in minY...maxY {
                     let rowBase = row * segBPR
@@ -218,121 +340,58 @@ struct ARCameraView: UIViewRepresentable {
                         let depth = depthPtr[dr * depthStride + dc]
 
                         guard depth.isFinite, depth > 0 else { continue }
-                        depthValues.append(depth)
+
+                        validPixelCount += 1
+                        minDepthSeen = min(minDepthSeen, depth)
+                        maxDepthSeen = max(maxDepthSeen, depth)
+
+                        if validPixelCount % sampleEvery == 0 {
+                            sampledDepths.append(depth)
+                        }
                     }
                 }
 
-                guard depthValues.count > 50 else { continue }
+                guard validPixelCount > 50, !sampledDepths.isEmpty else { continue }
 
-                depthValues.sort()
-                let count = depthValues.count
-                let median = depthValues[count / 2]
-                let minDepth = depthValues.first ?? median
-                let maxDepth = depthValues.last ?? median
-
-                rawPeople.append((
-                    rect: bbox,
-                    avg: median,
-                    min: minDepth,
-                    max: maxDepth,
-                    count: count
-                ))
-            }
-
-            return assignStableIDs(to: rawPeople)
-        }
-
-        private func assignStableIDs(
-            to rawPeople: [(rect: CGRect, avg: Float, min: Float, max: Float, count: Int)]
-        ) -> [PersonDepthInfo] {
-            var results: [PersonDepthInfo] = []
-            var newTracked: [TrackedPerson] = []
-            var usedPreviousIDs = Set<Int>()
-
-            for person in rawPeople {
-                let center = CGPoint(x: person.rect.midX, y: person.rect.midY)
-
-                var bestID: Int?
-                var bestDistance = CGFloat.greatestFiniteMagnitude
-
-                for prev in previousTrackedPeople where !usedPreviousIDs.contains(prev.id) {
-                    let prevCenter = CGPoint(x: prev.rect.midX, y: prev.rect.midY)
-                    let dx = center.x - prevCenter.x
-                    let dy = center.y - prevCenter.y
-                    let dist = sqrt(dx * dx + dy * dy)
-
-                    if dist < bestDistance, dist < 0.12 {
-                        bestDistance = dist
-                        bestID = prev.id
-                    }
-                }
-
-                let assignedID: Int
-                if let id = bestID {
-                    assignedID = id
-                    usedPreviousIDs.insert(id)
-                } else {
-                    assignedID = nextTrackedID
-                    nextTrackedID += 1
-                }
-
-                newTracked.append(TrackedPerson(id: assignedID, rect: person.rect))
-
-                results.append(
+                sampledDepths.sort()
+                let median = sampledDepths[sampledDepths.count / 2]
+                let rounded = Float(Int(median))
+                people.append(
                     PersonDepthInfo(
-                        id: assignedID,
-                        averageDepth: person.avg,
-                        minDepth: person.min,
-                        maxDepth: person.max,
-                        pixelCount: person.count,
-                        normRect: person.rect
+                        id: index,
+                        averageDepth: rounded,
+                        minDepth: minDepthSeen,
+                        maxDepth: maxDepthSeen,
+                        pixelCount: validPixelCount,
+                        normRect: bbox
                     )
                 )
             }
 
-            previousTrackedPeople = newTracked
-            return results.sorted { $0.id < $1.id }
+            return people
         }
-    }
-}
 
-// MARK: - Depth colour  (green = close → red = far, 0–8 m)
+        func session(_ session: ARSession, didFailWithError error: Error) {
+            DispatchQueue.main.async {
+                self.vm.statusMessage = "Error: \(error.localizedDescription)"
+            }
+        }
 
-private func depthColor(_ metres: Float) -> Color {
-    let t = Double(min(metres / 8.0, 1.0))
-    return Color(hue: (1.0 - t) * 0.35, saturation: 1, brightness: 1)
-}
+        func sessionWasInterrupted(_ session: ARSession) {
+            DispatchQueue.main.async {
+                self.vm.statusMessage = "Interrupted"
+            }
+        }
 
-// MARK: - Dot overlay
-
-struct PersonDotOverlay: View {
-    let people: [PersonDepthInfo]
-
-    var body: some View {
-        GeometryReader { geo in
-            ForEach(people) { person in
-                let r = person.normRect
-                let cx = r.midX * geo.size.width
-                let cy = (r.minY * geo.size.height) - 40
-                let c = depthColor(person.averageDepth)
-
-                ZStack {
-                    Circle().fill(c.opacity(0.25)).frame(width: 48, height: 48)
-                    Circle().fill(c).frame(width: 22, height: 22)
-                        .shadow(color: c.opacity(0.9), radius: 8)
-                    Text(String(format: "%.1fm", person.averageDepth))
-                        .font(.system(size: 11, weight: .black, design: .monospaced))
-                        .foregroundColor(.white)
-                        .shadow(color: .black.opacity(0.8), radius: 2)
-                        .offset(y: 30)
-                }
-                .position(x: cx, y: max(cy, 40))
+        func sessionInterruptionEnded(_ session: ARSession) {
+            DispatchQueue.main.async {
+                self.vm.statusMessage = "Resuming…"
             }
         }
     }
 }
 
-// MARK: - ContentView
+// MARK: - UI
 
 struct ContentView: View {
     @StateObject private var vm = ARViewModel()
@@ -340,9 +399,6 @@ struct ContentView: View {
     var body: some View {
         ZStack(alignment: .bottom) {
             ARCameraView(vm: vm)
-                .ignoresSafeArea()
-
-            PersonDotOverlay(people: vm.people)
                 .ignoresSafeArea()
 
             VStack(spacing: 0) {
@@ -379,25 +435,40 @@ struct ContentView: View {
 
 private struct PersonChip: View {
     let person: PersonDepthInfo
-    private var c: Color { depthColor(person.averageDepth) }
+
+    private var c: Color {
+        let t = Double(min(person.averageDepth / 8.0, 1.0))
+        return Color(hue: (1.0 - t) * 0.35, saturation: 1, brightness: 1)
+    }
 
     var body: some View {
         HStack(spacing: 8) {
-            Circle().fill(c).frame(width: 10, height: 10)
+            Circle()
+                .fill(c)
+                .frame(width: 10, height: 10)
                 .shadow(color: c.opacity(0.8), radius: 4)
+
             VStack(alignment: .leading, spacing: 2) {
                 Text("Person \(person.id)")
-                    .font(.caption2.bold()).foregroundColor(.white)
+                    .font(.caption2.bold())
+                    .foregroundColor(.white)
+
                 Text(String(format: "%.2f m", person.averageDepth))
                     .font(.system(size: 15, weight: .bold, design: .monospaced))
                     .foregroundColor(c)
+
                 Text(String(format: "%.1f – %.1f m", person.minDepth, person.maxDepth))
-                    .font(.caption2).foregroundColor(.white.opacity(0.5))
+                    .font(.caption2)
+                    .foregroundColor(.white.opacity(0.5))
             }
         }
-        .padding(.horizontal, 12).padding(.vertical, 8)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
         .background(Color.black.opacity(0.45))
         .cornerRadius(12)
-        .overlay(RoundedRectangle(cornerRadius: 12).stroke(c.opacity(0.6), lineWidth: 1))
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(c.opacity(0.6), lineWidth: 1)
+        )
     }
 }
